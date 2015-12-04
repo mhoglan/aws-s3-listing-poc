@@ -10,12 +10,12 @@ import (
 	"github.com/aws/aws-sdk-go/aws"
 	"github.com/aws/aws-sdk-go/aws/session"
 	"github.com/aws/aws-sdk-go/service/s3"
+	"github.com/rcrowley/go-metrics"
 	"log"
 	"os"
 	"strings"
-	"time"
 	"sync"
-	"github.com/rcrowley/go-metrics"
+	"time"
 )
 
 /**
@@ -27,19 +27,25 @@ import (
 **/
 
 type config struct {
-	MaxPages            int    `env:"key=MAX_PAGES default=0"`
-	MaxKeys             int    `env:"key=MAX_KEYS default=1000"`
-	AdvMaxPages         int    `env:"key=ADV_MAX_PAGES default=5"`
-	AdvMaxKeys          int    `env:"key=ADV_MAX_KEYS default=5"`
-	FileMaxPages        int    `env:"key=FILE_MAX_PAGES default=0"`
-	FileMaxKeys         int    `env:"key=FILE_MAX_KEYS default=1000"`
-	Force               bool   `env:"key=FORCE default=false"`
-	Region              string `env:"key=AWS_REGION required=true"`
-	Bucket              string `env:"key=AWS_BUCKET required=true"`
-	Prefix              string `env:"key=AWS_PREFIX required=true"`
-	OutputFormat        string `env:"key=OUTPUT_FORMAT default=csv"`
-	OutputLocation      string `env:"key=OUTPUT_LOCATION default=./target"`
-	ListAllWorkersCount int    `env:"key=LIST_ALL_WORKERS_COUNT default=5"`
+	MaxPages            int      `env:"key=MAX_PAGES default=0"`
+	MaxKeys             int      `env:"key=MAX_KEYS default=1000"`
+	AdvMaxPages         int      `env:"key=ADV_MAX_PAGES default=5"`
+	AdvMaxKeys          int      `env:"key=ADV_MAX_KEYS default=5"`
+	FileMaxPages        int      `env:"key=FILE_MAX_PAGES default=0"`
+	FileMaxKeys         int      `env:"key=FILE_MAX_KEYS default=1000"`
+	Force               bool     `env:"key=FORCE default=false"`
+	Region              string   `env:"key=AWS_REGION required=true"`
+	Bucket              string   `env:"key=AWS_BUCKET required=true"`
+	Prefix              string   `env:"key=AWS_PREFIX required=true"`
+	OutputFormat        string   `env:"key=OUTPUT_FORMAT default=csv"`
+	OutputLocation      string   `env:"key=OUTPUT_LOCATION default=./target"`
+	ListAllWorkersCount int      `env:"key=LIST_ALL_WORKERS_COUNT default=5"`
+	SubPrefixExclude    []string `env:"key=SUB_PREFIX_EXCLUDE decode=yaml"`
+	SubPrefixInclude    []string `env:"key=SUB_PREFIX_INCLUDE decode=yaml"`
+
+	// private (non-exported) vars for processing only; e.g. lookup maps
+	subPrefixExcludeLookup map[string]bool
+	subPrefixIncludeLookup map[string]bool
 }
 
 var cfg *config
@@ -86,19 +92,32 @@ type ListAllObjectsRequest struct {
 func main() {
 	t := metrics.NewTimer()
 	metrics.Register("duration", t)
-	
+
 	cfg = &config{}
 
 	if err := env.Process(cfg); err != nil {
 		log.Fatal(err)
 	}
 
+	// populate lookups for quick operations
+	cfg.subPrefixExcludeLookup = make(map[string]bool)
+	cfg.subPrefixIncludeLookup = make(map[string]bool)
+
+	for _, adv := range cfg.SubPrefixExclude {
+		cfg.subPrefixExcludeLookup[adv] = true
+	}
+
+	for _, adv := range cfg.SubPrefixInclude {
+		cfg.subPrefixIncludeLookup[adv] = true
+	}
+
+	log.Printf("+#%v", cfg.subPrefixExcludeLookup)
+	log.Printf("+#%v", cfg.subPrefixIncludeLookup)
 	t.Time(run)
-	
-	log.Printf("Execution time: %v", time.Duration(t.Sum()) * time.Nanosecond)
+
+	log.Printf("Execution time: %v", time.Duration(t.Sum())*time.Nanosecond)
 	metrics.WriteJSONOnce(metrics.DefaultRegistry, os.Stderr)
 }
-
 
 func run() {
 	cfg = &config{}
@@ -109,23 +128,22 @@ func run() {
 
 	output = stdoutOutput
 
-
 	listAllObjectsQueue := make(chan ListAllObjectsRequest, 5)
 	var wg sync.WaitGroup
-	
-	doneCallback := func() { 
+
+	doneCallback := func() {
 		defer wg.Done()
 		log.Printf("worker done")
 	}
-	
+
 	for i := 0; i < cfg.ListAllWorkersCount; i++ {
 		log.Printf("Starting worker%d", i+1)
-		worker := NewListObjectRequestWorker(i + 1, listAllObjectsQueue, doneCallback)
-		
+		worker := NewListObjectRequestWorker(i+1, listAllObjectsQueue, doneCallback)
+
 		wg.Add(1)
-		
-		go func(){
-//			wg.Add(1)
+
+		go func() {
+			//			wg.Add(1)
 			worker.Start()
 		}()
 	}
@@ -134,7 +152,7 @@ func run() {
 		ListAllObjectsProducer(listAllObjectsQueue)
 		close(listAllObjectsQueue)
 	}()
-	
+
 	wg.Wait()
 }
 
@@ -171,7 +189,7 @@ func ListAllObjectsProducer(listAllObjectsQueue chan ListAllObjectsRequest) {
 		}
 
 		fileParts := strings.Split(strings.Trim(file.File, "/"), "/")
-		advertiserId := fileParts[len(fileParts) - 1]
+		advertiserId := fileParts[len(fileParts)-1]
 
 		outputFile := fmt.Sprintf("%v/advertiser_%v", cfg.OutputLocation, advertiserId)
 
@@ -182,22 +200,35 @@ func ListAllObjectsProducer(listAllObjectsQueue chan ListAllObjectsRequest) {
 			}
 		}
 
-		request := ListAllObjectsRequest{Region: cfg.Region, Bucket: cfg.Bucket, Prefix: fmt.Sprintf("%v%v/", cfg.Prefix, advertiserId), Process: outputObject, OutputFile: outputFile }
+		log.Printf("+#%v", cfg.subPrefixExcludeLookup)
+
+		if _, ok := cfg.subPrefixExcludeLookup[advertiserId]; ok == true {
+			log.Printf("%v is in the sub prefix exclude list", advertiserId)
+			continue
+		}
+
+		if len(cfg.subPrefixIncludeLookup) > 0 {
+			if _, ok := cfg.subPrefixIncludeLookup[advertiserId]; ok == false {
+				log.Printf("%v is not in the sub prefix include list", advertiserId)
+				continue
+			}
+		}
+
+		request := ListAllObjectsRequest{Region: cfg.Region, Bucket: cfg.Bucket, Prefix: fmt.Sprintf("%v%v/", cfg.Prefix, advertiserId), Process: outputObject, OutputFile: outputFile}
 
 		listAllObjectsQueue <- request
 	}
-	
+
 	log.Println("Finish producer")
 }
-
 
 func (w ListObjectRequestWorker) Start() {
 
 	processRequestChan := make(chan ListAllObjectsRequest)
-	
+
 	go func() {
 		defer close(processRequestChan)
-		
+
 		for request := range w.RequestQueue {
 			log.Printf("popping request from queue for worker%d", w.ID)
 			select {
@@ -214,37 +245,37 @@ func (w ListObjectRequestWorker) Start() {
 
 	go func() {
 		defer w.DoneCallback()
-		
+
 		for request := range processRequestChan {
 			log.Printf("processing request for worker%d", w.ID)
 
-			f, err := os.OpenFile(request.OutputFile, os.O_WRONLY | os.O_CREATE, 0666)
+			f, err := os.OpenFile(request.OutputFile, os.O_WRONLY|os.O_CREATE, 0666)
 
 			if err != nil {
 				log.Fatalf("Cannot create file: %v | %v", request.OutputFile, err)
 			}
-			
+
 			fileOuput := func(o *ListObject) {
 				f.WriteString(printObject(o))
 			}
 
 			f.WriteString("\n")
-			
+
 			listObjects(request.Bucket, request.Prefix, "", s3.New(session.New(), aws.NewConfig().WithRegion(request.Region)), fileOuput)
-			
+
 			f.Close()
 		}
 
 		log.Printf("processor for worker%d finished", w.ID)
 	}()
 }
-			
+
 //				f, err := os.OpenFile(request.OutputFile, os.O_WRONLY | os.O_CREATE, 0666)
-//	
+//
 //				if err != nil {
 //					log.Fatalf("Cannot create file: %v | %v", request.OutputFile, err)
 //				}
-//	
+//
 //				outputFileHandle = f
 //				output = fileOutput
 
@@ -253,15 +284,15 @@ func (w ListObjectRequestWorker) Start() {
 //				f.WriteString("\n")
 //		}
 //	}()
-		
+
 //			select {
 //			case request := <-w.RequestQueue:
 //			//				f, err := os.OpenFile(request.OutputFile, os.O_WRONLY | os.O_CREATE, 0666)
-//			//	
+//			//
 //			//				if err != nil {
 //			//					log.Fatalf("Cannot create file: %v | %v", request.OutputFile, err)
 //			//				}
-//			//	
+//			//
 //			//				outputFileHandle = f
 //			//				output = fileOutput
 //
@@ -296,9 +327,9 @@ type ListObjectRequestWorker struct {
 func NewListObjectRequestWorker(id int, requestQueue chan ListAllObjectsRequest, doneCallback func()) ListObjectRequestWorker {
 
 	worker := ListObjectRequestWorker{
-		ID:    id,
+		ID:           id,
 		RequestQueue: requestQueue,
-		QuitChan: make(chan bool),
+		QuitChan:     make(chan bool),
 		DoneCallback: doneCallback,
 	}
 
