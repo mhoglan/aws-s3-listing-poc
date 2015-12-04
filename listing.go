@@ -15,6 +15,7 @@ import (
 	"strings"
 	"time"
 	"sync"
+	"github.com/rcrowley/go-metrics"
 )
 
 /**
@@ -83,6 +84,23 @@ type ListAllObjectsRequest struct {
 }
 
 func main() {
+	t := metrics.NewTimer()
+	metrics.Register("duration", t)
+	
+	cfg = &config{}
+
+	if err := env.Process(cfg); err != nil {
+		log.Fatal(err)
+	}
+
+	t.Time(run)
+	
+	log.Printf("Execution time: %v", time.Duration(t.Sum()) * time.Nanosecond)
+	metrics.WriteJSONOnce(metrics.DefaultRegistry, os.Stderr)
+}
+
+
+func run() {
 	cfg = &config{}
 
 	if err := env.Process(cfg); err != nil {
