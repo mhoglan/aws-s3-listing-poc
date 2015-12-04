@@ -111,8 +111,6 @@ func main() {
 		cfg.subPrefixIncludeLookup[adv] = true
 	}
 
-	log.Printf("+#%v", cfg.subPrefixExcludeLookup)
-	log.Printf("+#%v", cfg.subPrefixIncludeLookup)
 	t.Time(run)
 
 	log.Printf("Execution time: %v", time.Duration(t.Sum())*time.Nanosecond)
@@ -120,12 +118,6 @@ func main() {
 }
 
 func run() {
-	cfg = &config{}
-
-	if err := env.Process(cfg); err != nil {
-		log.Fatal(err)
-	}
-
 	output = stdoutOutput
 
 	listAllObjectsQueue := make(chan ListAllObjectsRequest, 5)
@@ -199,8 +191,6 @@ func ListAllObjectsProducer(listAllObjectsQueue chan ListAllObjectsRequest) {
 				continue
 			}
 		}
-
-		log.Printf("+#%v", cfg.subPrefixExcludeLookup)
 
 		if _, ok := cfg.subPrefixExcludeLookup[advertiserId]; ok == true {
 			log.Printf("%v is in the sub prefix exclude list", advertiserId)
